@@ -9,6 +9,7 @@
 5. The TT core (`tt/`) must contain **no project-specific mappings** (e.g. no hard-coded `@ghostfolio/…` import paths). Project-specific configuration belongs in `tt_import_map.json` inside the relevant scaffold directory, passed to the translator at call time.
 6. TT must not have project-specific logic which it simply copies into the translation. The translated code must be actually translated code, not pregenerated logic.
 7. You may use AST libraries.
+8. Your python code may not call node/js-tools or other external tools to translate the code. The translation should happen in python.
 
 ## Scaffold Rules
 
