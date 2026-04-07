@@ -1,0 +1,39 @@
+# Docker Compose overlay used during integration tests.
+#
+# Adds a mock Yahoo Finance HTTPS server so that symbol validation succeeds
+# without hitting the real Yahoo Finance API.  The mock handles:
+#   - finance.yahoo.com/quote/AAPL       (cookie seed)
+#   - query1.finance.yahoo.com/v1/test/getcrumb  (crumb)
+#   - query2.finance.yahoo.com/v10/finance/quoteSummary/{sym}
+#   - query2.finance.yahoo.com/v7/finance/quote
+#   - query2.finance.yahoo.com/v8/finance/chart/{sym}
+#
+# NODE_TLS_REJECT_UNAUTHORIZED=0 lets Node.js accept the self-signed cert.
+#
+# Usage (via spinup_and_test_ghostfolio.sh):
+#   docker compose -f docker-compose.yml -f docker-compose.test.yml ...
+
+services:
+  yahoo-mock:
+    build:
+      context: ../../../projecttests/tools/yahoo_mock
+    container_name: yahoo-mock
+    networks:
+      default:
+        aliases:
+          - finance.yahoo.com
+          - query1.finance.yahoo.com
+          - query2.finance.yahoo.com
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request,ssl; ctx=ssl.create_default_context(); ctx.check_hostname=False; ctx.verify_mode=ssl.CERT_NONE; urllib.request.urlopen('https://localhost/v1/test/getcrumb',context=ctx)\""]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  ghostfolio:
+    environment:
+      - NODE_TLS_REJECT_UNAUTHORIZED=0
+    depends_on:
+      yahoo-mock:
+        condition: service_healthy

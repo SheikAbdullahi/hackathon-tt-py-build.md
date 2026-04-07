@@ -1,0 +1,24 @@
+# Coverage overlay — replaces the pre-built Ghostfolio image with a locally-built
+# version that runs under NODE_V8_COVERAGE so integration-test code paths are
+# recorded as raw V8 coverage JSON files.
+#
+# Usage (via coverage_ghostfolio_integration.sh):
+#   docker compose -f docker-compose.yml \
+#                  -f docker-compose.test.yml \
+#                  -f docker-compose.coverage.yml ...
+
+services:
+  ghostfolio:
+    # Override the pre-built image with our source-built coverage image
+    image: ghostfolio-coverage:local
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.coverage
+    environment:
+      - NODE_V8_COVERAGE=/coverage
+    volumes:
+      - v8_coverage:/coverage
+
+volumes:
+  v8_coverage:
+    name: ghostfolio_v8_coverage

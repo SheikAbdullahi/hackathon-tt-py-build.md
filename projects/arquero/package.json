@@ -1,0 +1,56 @@
+{
+  "name": "arquero",
+  "type": "module",
+  "version": "8.0.3",
+  "description": "Query processing and transformation of array-backed data tables.",
+  "keywords": [
+    "data",
+    "query",
+    "database",
+    "table",
+    "dataframe",
+    "transform",
+    "arrays"
+  ],
+  "license": "BSD-3-Clause",
+  "author": "Jeffrey Heer (http://idl.cs.washington.edu)",
+  "main": "./src/index.js",
+  "module": "./src/index.js",
+  "unpkg": "./dist/arquero.min.js",
+  "jsdelivr": "./dist/arquero.min.js",
+  "types": "./dist/types/index.d.ts",
+  "browser": {
+    "./src/format/stream/byte-stream.js": "./src/format/stream/byte-stream-web.js"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/uwdata/arquero.git"
+  },
+  "scripts": {
+    "prebuild": "rimraf dist && mkdir dist",
+    "build": "rollup -c rollup.config.js",
+    "postbuild": "tsc",
+    "perf": "TZ=America/Los_Angeles tape 'perf/**/*-perf.js'",
+    "lint": "eslint src test",
+    "test": "TZ=America/Los_Angeles mocha 'test/**/*-test.js' --timeout 5000",
+    "posttest": "npm run lint && tsc --project jsconfig.json",
+    "prepublishOnly": "npm test && npm run build"
+  },
+  "dependencies": {
+    "@uwdata/flechette": "^2.0.0",
+    "acorn": "^8.14.1"
+  },
+  "devDependencies": {
+    "@rollup/plugin-node-resolve": "^16.0.1",
+    "@rollup/plugin-terser": "^0.4.4",
+    "@types/punycode": "^2.1.4",
+    "apache-arrow": "20.0.0",
+    "eslint": "^9.27.0",
+    "mocha": "^11.5.0",
+    "rimraf": "^6.0.1",
+    "rollup": "^4.41.1",
+    "rollup-plugin-bundle-size": "^1.0.3",
+    "tape": "^5.9.0",
+    "typescript": "^5.8.3"
+  }
+}

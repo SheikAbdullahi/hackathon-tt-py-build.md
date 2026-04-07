@@ -1,0 +1,15 @@
+{
+  "include": ["src/index.js"],
+  "compilerOptions": {
+    "allowJs": true,
+    "checkJs": true,
+    "declaration": true,
+    "emitDeclarationOnly": true,
+    "esModuleInterop": true,
+    "module": "nodenext",
+    "moduleResolution": "nodenext",
+    "outDir": "dist/types",
+    "target": "es2022",
+    "skipLibCheck": true
+  }
+}

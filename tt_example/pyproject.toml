@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tt-example"
+version = "0.1.0"
+description = "Minimal example translation tool — scaffold only, no actual translation"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.30",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.2",
+    "requests>=2.32",
+]
+
+[project.scripts]
+tt_example = "tt_example.cli:main"
+
+[tool.setuptools.packages]
+find = {}
