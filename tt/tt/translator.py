@@ -33,9 +33,6 @@ def _translate_line(line: str) -> str:
     if not stripped:
         return ''
 
-    # Drop standalone `)` or `);` — leftover from collapsed multi-line calls
-    if re.match(r'^\s*\);\s*$', line) or re.match(r'^\s*\)\s*$', line):
-        return ''
     # Convert // comments to #
     if stripped.startswith('//'):
         return indent + '#' + stripped[2:]
@@ -48,6 +45,13 @@ def _translate_line(line: str) -> str:
     if re.match(r'^import\s+', stripped):
         return ''
 
+    # Drop TS index-signature type lines: `[key: string]: Type` or `} = {}`
+    if re.match(r'^\[[\w]+\s*:\s*\w+\]\s*:', stripped):
+        return ''
+
+    # Drop lines that are purely a type block closing: `} = {}`
+    if re.match(r'^}\s*=\s*\{\}', stripped):
+        return ''
     # Remove export/abstract/access modifier keywords from line starts
     line = re.sub(r'^(\s*)export\s+(abstract\s+)?', r'\1', line)
     line = re.sub(r'^(\s*)abstract\s+', r'\1', line)
@@ -64,6 +68,11 @@ def _translate_line(line: str) -> str:
     # --- Drop instance field declarations: private/protected/public name: Type ---
     m = re.match(r'^(\s*)(private|protected|public)\s+(\w+)\s*:', stripped)
     if m and '(' not in stripped:
+        return ''
+
+    # --- Drop TS variable type-only declarations: `name: SomeType {` with no `=` ---
+    # e.g. `investmentValuesAccumulatedWithCurrencyEffect: { [date: string]: Big } = {}`
+    if re.match(r'^\w+\s*:\s*\{', stripped) and '=' not in stripped:
         return ''
 
     # --- Static property ---
@@ -425,8 +434,9 @@ def _convert_braces_to_indent(lines: list[str]) -> list[str]:
     """Convert TypeScript brace-based blocks to Python indentation."""
     result = []
     INDENT = "    "
-    # Stack: (indent_level, is_object_literal)
-    stack: list[tuple[int, bool]] = [(0, False)]
+    # Stack: (indent_level, is_object_literal, needs_close_brace)
+    # needs_close_brace = True when the obj was opened as `return {` or `x = {` (needs explicit `}`)
+    stack: list[tuple[int, bool, bool]] = [(0, False, False)]
 
     i = 0
     while i < len(lines):
@@ -438,7 +448,7 @@ def _convert_braces_to_indent(lines: list[str]) -> list[str]:
             i += 1
             continue
 
-        level, in_obj = stack[-1]
+        level, in_obj, needs_close = stack[-1]
 
         # Handle `} else if (...) {`
         if re.match(r'^}\s*else\s+if\s*\(', stripped) and not in_obj:
@@ -449,7 +459,7 @@ def _convert_braces_to_indent(lines: list[str]) -> list[str]:
             if cond_m:
                 cond = _simple_translate(cond_m.group(1))
                 result.append(INDENT * level + f'elif {cond}:')
-            stack.append((level + 1, False))
+            stack.append((level + 1, False, False))
             i += 1
             continue
 
@@ -459,17 +469,18 @@ def _convert_braces_to_indent(lines: list[str]) -> list[str]:
                 stack.pop()
             level = stack[-1][0]
             result.append(INDENT * level + 'else:')
-            stack.append((level + 1, False))
+            stack.append((level + 1, False, False))
             i += 1
             continue
 
         # Handle lone `}` or `};`
         if re.match(r'^}\s*;?\s*$', stripped):
             if in_obj:
-                # Close object literal — emit the closing `}` for multi-line Python dicts
+                # Close object literal — emit `}` only for standalone return/assignment dicts
                 stack.pop()
                 level = stack[-1][0]
-                result.append(INDENT * level + '}')
+                if needs_close:
+                    result.append(INDENT * level + '}')
             else:
                 # Close code block - just pop
                 if len(stack) > 1:
@@ -483,7 +494,7 @@ def _convert_braces_to_indent(lines: list[str]) -> list[str]:
                 stack.pop()
             level = stack[-1][0]
             result.append(INDENT * level + 'except Exception as e:')
-            stack.append((level + 1, False))
+            stack.append((level + 1, False, False))
             i += 1
             continue
 
@@ -493,7 +504,7 @@ def _convert_braces_to_indent(lines: list[str]) -> list[str]:
                 stack.pop()
             level = stack[-1][0]
             result.append(INDENT * level + 'finally:')
-            stack.append((level + 1, False))
+            stack.append((level + 1, False, False))
             i += 1
             continue
 
@@ -510,7 +521,7 @@ def _convert_braces_to_indent(lines: list[str]) -> list[str]:
             py_line = _convert_ts_obj_property_line(stripped, INDENT * level)
             result.append(py_line)
             if opens_obj_literal:
-                stack.append((level + 1, True))
+                stack.append((level + 1, True, False))
                 # Replace last appended line to include the {
                 result[-1] = result[-1].rstrip()
                 if not result[-1].endswith('{'):
@@ -521,13 +532,14 @@ def _convert_braces_to_indent(lines: list[str]) -> list[str]:
 
             if opens_obj_literal:
                 # Object literal opener: emit the `return {` or similar
-                # Remove trailing { and add it back properly
                 base = stripped.rstrip('{').rstrip()
                 result.append(INDENT * level + base + ' {')
-                stack.append((level + 1, True))
+                # needs_close=True only for standalone return/assignment dicts
+                is_standalone = bool(re.match(r'^return\s*$', base) or re.search(r'=\s*$', base))
+                stack.append((level + 1, True, is_standalone))
             elif opens_code_block:
                 result.append(INDENT * level + py_line)
-                stack.append((level + 1, False))
+                stack.append((level + 1, False, False))
             else:
                 result.append(INDENT * level + py_line)
 
@@ -1210,10 +1222,28 @@ def _drop_logger_warn_args(code: str) -> str:
     return '\n'.join(result)
 
 
+def _drop_orphan_close_parens(code: str) -> str:
+    """Remove standalone `)` or `);` lines when the previous non-empty line already ends with `)` or `))`.
+    These arise from multi-line TS calls that get partially collapsed."""
+    lines = code.split('\n')
+    result = []
+    for line in lines:
+        s = line.strip()
+        if s in (')', ');'):
+            # Find the previous non-empty result line
+            prev = next((r.rstrip() for r in reversed(result) if r.strip()), '')
+            # If previous line ends with `)` or `))`, this is a duplicate closer
+            if prev.endswith(')') or prev.endswith('));') or prev.endswith('))'):
+                continue
+        result.append(line)
+    return '\n'.join(result)
+
+
 def _post_process(code: str) -> str:
     """Fix common translation artifacts."""
     code = _drop_logger_warn_args(code)
     code = _drop_logger_console_args(code)
+    code = _drop_orphan_close_parens(code)
     code = _fix_ternary(code)
     code = _fix_unquoted_keys(code)
     # Fix (None or {}).get("x") -> None
