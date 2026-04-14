@@ -473,6 +473,16 @@ def _convert_braces_to_indent(lines: list[str]) -> list[str]:
             i += 1
             continue
 
+        # Handle `})` or `});` — close obj literal + close outer call
+        if re.match(r'^}\s*\)+\s*;?\s*$', stripped):
+            close_parens = stripped.count(')')
+            if in_obj:
+                stack.pop()
+                level = stack[-1][0]
+            result.append(INDENT * level + ')' * close_parens)
+            i += 1
+            continue
+
         # Handle lone `}` or `};`
         if re.match(r'^}\s*;?\s*$', stripped):
             if in_obj:
@@ -585,8 +595,13 @@ def _translate_control_flow_line(stripped: str) -> str:
     if m and stripped.rstrip().endswith('{'):
         rest = stripped[m.end():]  # everything after `for (const VAR of `
         close_idx = rest.rfind(')')  # last `)` is the for-loop's outer closer
-        if close_idx >= 0:
-            arr_raw = rest[:close_idx + 1].strip()  # include the `)` at close_idx (iterable's last paren)
+            if close_idx >= 0:
+                # Check if rest[:close_idx] is paren-balanced; if not, include the char at close_idx
+                candidate = rest[:close_idx].strip()
+                if candidate.count('(') == candidate.count(')'):
+                    arr_raw = candidate
+                else:
+                    arr_raw = rest[:close_idx + 1].strip()
             arr = _simple_translate(arr_raw)
             return f'for {m.group(1)} in {arr}:'
 
