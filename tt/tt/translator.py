@@ -33,6 +33,9 @@ def _translate_line(line: str) -> str:
     if not stripped:
         return ''
 
+    # Drop standalone `)` or `);` — leftover from collapsed multi-line calls
+    if re.match(r'^\s*\);\s*$', line) or re.match(r'^\s*\)\s*$', line):
+        return ''
     # Convert // comments to #
     if stripped.startswith('//'):
         return indent + '#' + stripped[2:]
@@ -463,8 +466,10 @@ def _convert_braces_to_indent(lines: list[str]) -> list[str]:
         # Handle lone `}` or `};`
         if re.match(r'^}\s*;?\s*$', stripped):
             if in_obj:
-                # Close object literal — just pop, no output (Python dicts use `}` inline)
+                # Close object literal — emit the closing `}` for multi-line Python dicts
                 stack.pop()
+                level = stack[-1][0]
+                result.append(INDENT * level + '}')
             else:
                 # Close code block - just pop
                 if len(stack) > 1:
@@ -563,15 +568,15 @@ def _translate_control_flow_line(stripped: str) -> str:
     if stripped in ('else {', 'else{'):
         return 'else:'
 
-    # for (const x of arr) {  — use rfind to handle nested parens in arr expression
-    m = re.match(r'^for\s*\(\s*(?:const|let|var)\s+(\w+)\s+of\s+(.+)\s*\{$', stripped)
-    if m:
-        # group(2) ends with `) ` or `)` — strip the closing paren of the for(
-        arr_raw = m.group(2).rstrip()
-        if arr_raw.endswith(')'):
-            arr_raw = arr_raw[:-1].rstrip()  # remove the outer for( closing paren
-        arr = _simple_translate(arr_raw)
-        return f'for {m.group(1)} in {arr}:'
+    # for (const x of arr) {  — use rfind to find the outer closing paren
+    m = re.match(r'^for\s*\(\s*(?:(?:const|let|var)\s+)?(\w+)\s+of\s+', stripped)
+    if m and stripped.rstrip().endswith('{'):
+        rest = stripped[m.end():]  # everything after `for (const VAR of `
+        close_idx = rest.rfind(')')  # last `)` is the for-loop's outer closer
+        if close_idx >= 0:
+            arr_raw = rest[:close_idx + 1].strip()  # include the `)` at close_idx (iterable's last paren)
+            arr = _simple_translate(arr_raw)
+            return f'for {m.group(1)} in {arr}:'
 
     # for (const [k, v] of ...) {
     m = re.match(r'^for\s*\(\s*(?:const|let)\s+\[(\w+),\s*(\w+)\]\s+of\s+(.+)\)\s*\{$', stripped)
@@ -883,10 +888,12 @@ def _collapse_arrow_callbacks(ts_content: str) -> str:
                     lambda_expr = re.sub(r'\b' + re.escape(prop) + r'\b',
                                          f'(_x or {{}}).get("{prop}")', lambda_expr)
 
-            # j now points to the `}` that closed the callback body.
-            # The actual call-closer (e.g. `)) {`) may be on the next line.
-            # Consume the `}` line itself, then peek at the next line.
-            j += 1  # skip the closing `}`
+            # j now points to the line containing the closing `}` of the callback body.
+            # Extract any suffix on that same line (e.g. `}).length,` → suffix=`.length,`)
+            closing_line = lines[j].strip() if j < len(lines) else ''
+            # strip the leading `}` (and optional `)`) to get what follows
+            after_close = re.sub(r'^[})\s]+', '', closing_line).strip()
+            j += 1  # advance past the closing `}` line
             suffix_after = lines[j].strip() if j < len(lines) else ''
             # If next line is just closing parens + optional `{`, consume it too
             if re.match(r'^[)\s]+\{?\s*$', suffix_after):
@@ -902,7 +909,9 @@ def _collapse_arrow_callbacks(ts_content: str) -> str:
                 leading_close = re.match(r'^([}\)]+)', suffix_after or '')
                 extra_close = leading_close.group(1).replace('}', '').count(')') if leading_close else 0
                 close_parens = ')' * (1 + extra_close)
-                new_line = f'{prefix}{lambda_expr}{close_parens}{suffix_clean}'
+                # Use after_close (e.g. `.length,`) if present, else suffix_clean
+                trail = after_close if after_close else suffix_clean
+                new_line = f'{prefix}{lambda_expr}{close_parens}{trail}'
                 if opens_block:
                     new_line += ' {'
             else:
@@ -913,7 +922,11 @@ def _collapse_arrow_callbacks(ts_content: str) -> str:
                     new_line += ' {'
 
             result.append(new_line)
-            i = j + 1
+            # If suffix_after was NOT consumed (else branch, not a paren-closer), back up so it gets processed
+            if re.match(r'^[)\s]+\{?\s*$', suffix_after) or not suffix_after:
+                i = j + 1
+            else:
+                i = j  # let suffix_after line be processed normally
             continue
 
         result.append(line)
@@ -1028,12 +1041,54 @@ def _join_split_method_signatures(ts_content: str) -> str:
     return '\n'.join(result)
 
 
+def _rewrite_for_of_loops(ts_content: str) -> str:
+    """
+    Rewrite `for (const x of expr) {` → `for (x of expr) {`
+    using paren-depth counting so nested parens in expr are handled correctly.
+    The result is still TS-style for...of so _translate_control_flow_line can match it.
+    """
+    lines = ts_content.split('\n')
+    result = []
+    for line in lines:
+        m = re.match(r'^(\s*)for\s*\(\s*(?:const|let|var)\s+(\w+)\s+of\s+', line)
+        if m:
+            indent = m.group(1)
+            var = m.group(2)
+            pos = m.end()
+            # depth=-1 accounts for the outer `for(` already consumed by the regex
+            depth = -1
+            end_pos = len(line)
+            for i in range(pos, len(line)):
+                c = line[i]
+                if c == '(':
+                    depth += 1
+                elif c == ')':
+                    depth -= 1
+                    if depth < 0:
+                        end_pos = i
+                        break
+            if end_pos == len(line):
+                # No closing ) found — multi-line for...of, leave unchanged
+                result.append(line)
+                continue
+            iterable = line[pos:end_pos].strip()
+            suffix = line[end_pos + 1:].strip()
+            if suffix.startswith('{'):
+                result.append(f'{indent}for (const {var} of {iterable}) {{')
+            else:
+                result.append(f'{indent}for (const {var} of {iterable}) {suffix}')
+            continue
+        result.append(line)
+    return '\n'.join(result)
+
+
 def translate_typescript_content(ts_content: str) -> str:
     """Translate TypeScript source code to Python."""
     ts_content = _strip_multiline_imports(ts_content)
     ts_content = _join_split_method_signatures(ts_content)
     ts_content = _strip_ts_type_blocks(ts_content)
     ts_content = _collapse_arrow_callbacks(ts_content)
+    ts_content = _rewrite_for_of_loops(ts_content)
     lines = ts_content.split('\n')
 
     # Phase 1: Destructuring
