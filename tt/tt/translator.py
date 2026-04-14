@@ -45,9 +45,10 @@ def _translate_line(line: str) -> str:
     if re.match(r'^import\s+', stripped):
         return ''
 
-    # Remove export/abstract keywords
+    # Remove export/abstract/access modifier keywords from line starts
     line = re.sub(r'^(\s*)export\s+(abstract\s+)?', r'\1', line)
     line = re.sub(r'^(\s*)abstract\s+', r'\1', line)
+    line = re.sub(r'^(\s*)(private|protected|public|override)\s+(?!static\s)', r'\1', line)
 
     # --- Class declaration ---
     line = re.sub(
@@ -56,6 +57,11 @@ def _translate_line(line: str) -> str:
         line
     )
     line = re.sub(r'^(\s*)class\s+(\w+)\s*\{', r'\1class \2:', line)
+
+    # --- Drop instance field declarations: private/protected/public name: Type ---
+    m = re.match(r'^(\s*)(private|protected|public)\s+(\w+)\s*:', stripped)
+    if m and '(' not in stripped:
+        return ''
 
     # --- Static property ---
     m = re.match(
@@ -454,10 +460,8 @@ def _convert_braces_to_indent(lines: list[str]) -> list[str]:
         # Handle lone `}` or `};`
         if re.match(r'^}\s*;?\s*$', stripped):
             if in_obj:
-                # Close object literal - emit the closing brace
+                # Close object literal — just pop, no output (Python dicts use `}` inline)
                 stack.pop()
-                new_level = stack[-1][0]
-                result.append(INDENT * new_level + '}')
             else:
                 # Close code block - just pop
                 if len(stack) > 1:
@@ -678,6 +682,8 @@ def _translate_arrow_functions(code: str) -> str:
 
 def _strip_type_annotations(line: str) -> str:
     """Remove TypeScript type annotations."""
+    # Strip split method return type: ): ReturnType: or ): ReturnType {
+    line = re.sub(r'^\s*\)\s*:\s*[A-Z]\w*(?:<[^>]*>)?\s*[:{]?\s*$', ')', line)
     # Remove inline type annotations in variable declarations
     # x: { [key: string]: Big } = ...  -> x = ...
     line = re.sub(r':\s*\{\s*\[[^\]]+\]\s*:\s*[^}]+\}\s*=', ' =', line)
@@ -802,10 +808,151 @@ def _strip_multiline_imports(ts_content: str) -> str:
     return ts_content
 
 
+def _collapse_arrow_callbacks(ts_content: str) -> str:
+    """
+    Collapse multi-line destructured arrow callbacks into single-line lambdas.
+
+    Handles both same-line and split-line cases:
+      arr.filter(          arr.filter(lambda _x: (_x or {}).get('prop'))
+        ({ prop }) => {  →
+          return prop
+        })
+    """
+    lines = ts_content.split('\n')
+    result = []
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+
+        # Case 1: same-line — `method(({ props }) => {`
+        same = re.search(r'(\w+)\s*\(\s*\(\s*\{([^}]+)\}\s*\)\s*=>\s*\{', line)
+
+        # Case 2: split-line — current line ends with `filter(` or similar,
+        #         next line is `({ props }) => {`
+        split_trigger = None
+        if not same and i + 1 < len(lines):
+            next_s = lines[i + 1].strip()
+            if (line.rstrip().endswith('(') and
+                    re.match(r'^\(\s*\{[^}]+\}\s*\)\s*=>\s*\{', next_s)):
+                split_trigger = i  # current line is the call prefix
+
+        if same or split_trigger is not None:
+            if same:
+                indent = line[: len(line) - len(line.lstrip())]
+                prefix = line[:same.start() + len(same.group(1)) + 1]  # up to `method(`
+                props_raw = same.group(2)
+                j = i + 1
+            else:
+                # split case: join prefix line + next line to extract props
+                indent = line[: len(line) - len(line.lstrip())]
+                prefix = line  # e.g. `    for (const x of positions.filter(`
+                m2 = re.match(r'^\(\s*\{([^}]+)\}\s*\)\s*=>\s*\{', lines[i + 1].strip())
+                props_raw = m2.group(1)
+                j = i + 2
+
+            props = [p.strip().split(':')[0].rstrip('?').strip()
+                     for p in props_raw.split(',') if p.strip()]
+
+            # Collect callback body until depth returns to 0
+            body_lines = []
+            depth = 1
+            while j < len(lines) and depth > 0:
+                s = lines[j].strip()
+                depth += s.count('{') - s.count('}')
+                if depth <= 0:
+                    break
+                if s and not s.startswith('//'):
+                    body_lines.append(s.rstrip(';'))
+                j += 1
+
+            # Build lambda
+            lambda_expr = 'lambda _x: _x'  # fallback
+            if len(body_lines) == 1 and body_lines[0].startswith('return '):
+                expr = body_lines[0][len('return '):]
+                lambda_expr = f'lambda _x: {expr}'
+                for prop in props:
+                    lambda_expr = re.sub(r'\b' + re.escape(prop) + r'\b',
+                                         f'(_x or {{}}).get("{prop}")', lambda_expr)
+
+            # j now points to the `}` that closed the callback body.
+            # The actual call-closer (e.g. `)) {`) may be on the next line.
+            # Consume the `}` line itself, then peek at the next line.
+            j += 1  # skip the closing `}`
+            suffix_after = lines[j].strip() if j < len(lines) else ''
+            # If next line is just closing parens + optional `{`, consume it too
+            if re.match(r'^[)\s]+\{?\s*$', suffix_after):
+                opens_block = bool(re.search(r'\{', suffix_after))
+                suffix_clean = ''
+                j += 1  # consume the closer line
+            else:
+                opens_block = bool(re.search(r'\{$', suffix_after))
+                suffix_clean = re.sub(r'^[}\)]+\s*', '', suffix_after).strip().rstrip('{').strip()
+
+            if same:
+                new_line = f'{prefix}{lambda_expr}){suffix_clean}'
+                if opens_block:
+                    new_line += ' {'
+            else:
+                new_line = f'{prefix.rstrip()}{lambda_expr})'
+                if suffix_clean:
+                    new_line += suffix_clean
+                if opens_block:
+                    new_line += ' {'
+
+            result.append(new_line)
+            i = j + 1
+            continue
+
+        result.append(line)
+        i += 1
+    return '\n'.join(result)
+
+
+def _strip_ts_type_blocks(ts_content: str) -> str:
+    """
+    Strip TypeScript type annotation blocks from method signatures.
+    Handles: `}: { ... } & SomeType): ReturnType {`
+    Collapses the entire type block into just `) {`.
+    """
+    lines = ts_content.split('\n')
+    result = []
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        # Detect start of a TS type block in a method signature: `  }: {`
+        if re.match(r'^\s*\}\s*:\s*\{', line.rstrip()):
+            # Skip lines until we find the closing `} & ...): ReturnType {`
+            j = i
+            while j < len(lines):
+                s = lines[j].strip()
+                # End of type block: `} & SomeType): ReturnType {`  or just `}) {`
+                if re.search(r'\)\s*:\s*\w+.*\{?\s*$', s) and ('}' in s or ')' in s):
+                    # Emit just `) {` to close the method param list
+                    indent = line[: len(line) - len(line.lstrip())]
+                    if s.endswith('{'):
+                        result.append(indent + ') {')
+                    else:
+                        result.append(indent + ')')
+                    i = j + 1
+                    break
+                j += 1
+            else:
+                result.append(line)
+                i += 1
+            continue
+        result.append(line)
+        i += 1
+    return '\n'.join(result)
+
+
 def translate_typescript_content(ts_content: str) -> str:
     """Translate TypeScript source code to Python."""
     # Pre-process: remove multi-line imports
     ts_content = _strip_multiline_imports(ts_content)
+    # Pre-process: strip TS type annotation blocks from method signatures
+    ts_content = _strip_ts_type_blocks(ts_content)
+    # Pre-process: collapse multi-line arrow callbacks
+    ts_content = _collapse_arrow_callbacks(ts_content)
     lines = ts_content.split('\n')
 
     # Phase 1: Destructuring
@@ -833,6 +980,9 @@ def translate_typescript_content(ts_content: str) -> str:
     # Phase 4: Brace → indent
     result = _convert_braces_to_indent(filtered)
 
+    # Phase 4b: Join split assignments (line ends with bare `=`)
+    result = _fix_split_assignments(result)
+
     # Phase 5: Arrow functions
     code = '\n'.join(result)
     code = _translate_arrow_functions(code)
@@ -843,8 +993,47 @@ def translate_typescript_content(ts_content: str) -> str:
     return code
 
 
+def _fix_split_assignments(lines: list[str]) -> list[str]:
+    """Join lines where assignment RHS is on the next line (ends with bare `=`)."""
+    result = []
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        if line.rstrip().endswith('=') and line.strip() and not line.strip().startswith('#'):
+            j = i + 1
+            while j < len(lines) and not lines[j].strip():
+                j += 1
+            if j < len(lines):
+                result.append(line.rstrip() + ' ' + lines[j].strip())
+                i = j + 1
+                continue
+        result.append(line)
+        i += 1
+    return result
+
+
+def _drop_logger_warn_args(code: str) -> str:
+    """Drop argument lines and closing ) left by commented-out Logger.warn calls."""
+    lines = code.split('\n')
+    result = []
+    skip_until_paren = False
+    for line in lines:
+        s = line.strip()
+        if '# Logger.warn(' in line:
+            result.append(line)
+            skip_until_paren = True
+            continue
+        if skip_until_paren:
+            if s == ')':
+                skip_until_paren = False
+            continue
+        result.append(line)
+    return '\n'.join(result)
+
+
 def _post_process(code: str) -> str:
     """Fix common translation artifacts."""
+    code = _drop_logger_warn_args(code)
     # Fix (None or {}).get("x") -> None
     code = re.sub(r'\(None or \{\}\)\.get\("(\w+)"\)', r'None', code)
     # Collapse double spaces
