@@ -50,13 +50,13 @@ def _translate_line(line: str) -> str:
     line = re.sub(r'^(\s*)abstract\s+', r'\1', line)
     line = re.sub(r'^(\s*)(private|protected|public|override)\s+(?!static\s)', r'\1', line)
 
-    # --- Class declaration ---
+    # --- Class declaration --- keep `{` so brace converter pushes the class body level
     line = re.sub(
         r'^(\s*)class\s+(\w+)\s+extends\s+(\w+)\s*\{',
-        r'\1class \2(\3):',
+        r'\1class \2(\3): {',
         line
     )
-    line = re.sub(r'^(\s*)class\s+(\w+)\s*\{', r'\1class \2:', line)
+    line = re.sub(r'^(\s*)class\s+(\w+)\s*\{', r'\1class \2: {', line)
 
     # --- Drop instance field declarations: private/protected/public name: Type ---
     m = re.match(r'^(\s*)(private|protected|public)\s+(\w+)\s*:', stripped)
@@ -228,7 +228,8 @@ def _translate_method_declaration(line: str) -> str:
     async_prefix = 'async ' if is_async else ''
     getter_deco = f'{indent}@property\n' if is_getter else ''
 
-    return f'{getter_deco}{indent}{async_prefix}def {py_name}({params}):'
+    # Keep `{` so brace converter pushes the method body indent level
+    return f'{getter_deco}{indent}{async_prefix}def {py_name}({params}): {{'
 
 
 def _to_snake_case(name: str) -> str:
@@ -438,7 +439,8 @@ def _convert_braces_to_indent(lines: list[str]) -> list[str]:
 
         # Handle `} else if (...) {`
         if re.match(r'^}\s*else\s+if\s*\(', stripped) and not in_obj:
-            stack.pop()
+            if len(stack) > 1:
+                stack.pop()
             level = stack[-1][0]
             cond_m = re.search(r'else\s+if\s*\((.+)\)\s*\{?$', stripped)
             if cond_m:
@@ -450,7 +452,8 @@ def _convert_braces_to_indent(lines: list[str]) -> list[str]:
 
         # Handle `} else {`
         if re.match(r'^}\s*else\s*\{$', stripped) and not in_obj:
-            stack.pop()
+            if len(stack) > 1:
+                stack.pop()
             level = stack[-1][0]
             result.append(INDENT * level + 'else:')
             stack.append((level + 1, False))
@@ -560,10 +563,14 @@ def _translate_control_flow_line(stripped: str) -> str:
     if stripped in ('else {', 'else{'):
         return 'else:'
 
-    # for (const x of arr) {
-    m = re.match(r'^for\s*\(\s*(?:const|let|var)\s+(\w+)\s+of\s+(.+)\)\s*\{$', stripped)
+    # for (const x of arr) {  — use rfind to handle nested parens in arr expression
+    m = re.match(r'^for\s*\(\s*(?:const|let|var)\s+(\w+)\s+of\s+(.+)\s*\{$', stripped)
     if m:
-        arr = _simple_translate(m.group(2))
+        # group(2) ends with `) ` or `)` — strip the closing paren of the for(
+        arr_raw = m.group(2).rstrip()
+        if arr_raw.endswith(')'):
+            arr_raw = arr_raw[:-1].rstrip()  # remove the outer for( closing paren
+        arr = _simple_translate(arr_raw)
         return f'for {m.group(1)} in {arr}:'
 
     # for (const [k, v] of ...) {
@@ -595,8 +602,8 @@ def _translate_control_flow_line(stripped: str) -> str:
     # Remove trailing { if line still ends with it
     if stripped.endswith('{') and not stripped.endswith('${'):
         stripped = stripped[:-1].rstrip()
-        if stripped.endswith(')') or stripped.endswith(':'):
-            return stripped + ':'
+        if stripped.endswith(':'):
+            return stripped  # already has colon
         return stripped + ':'
 
     # Remove trailing ;
@@ -824,8 +831,8 @@ def _collapse_arrow_callbacks(ts_content: str) -> str:
     while i < len(lines):
         line = lines[i]
 
-        # Case 1: same-line — `method(({ props }) => {`
-        same = re.search(r'(\w+)\s*\(\s*\(\s*\{([^}]+)\}\s*\)\s*=>\s*\{', line)
+        # Case 1: same-line — `method(({ props }) => {` OR `method(x, ({ props }) => {`
+        same = re.search(r'(\w+)\s*\([^)]*,?\s*\(\s*\{([^}]+)\}\s*\)\s*=>\s*\{', line)
 
         # Case 2: split-line — current line ends with `filter(` or similar,
         #         next line is `({ props }) => {`
@@ -839,7 +846,9 @@ def _collapse_arrow_callbacks(ts_content: str) -> str:
         if same or split_trigger is not None:
             if same:
                 indent = line[: len(line) - len(line.lstrip())]
-                prefix = line[:same.start() + len(same.group(1)) + 1]  # up to `method(`
+                # prefix = everything up to (but not including) the `({` of the callback
+                cb_start = same.start() + same.group(0).index('({')
+                prefix = line[:cb_start]
                 props_raw = same.group(2)
                 j = i + 1
             else:
@@ -889,7 +898,11 @@ def _collapse_arrow_callbacks(ts_content: str) -> str:
                 suffix_clean = re.sub(r'^[}\)]+\s*', '', suffix_after).strip().rstrip('{').strip()
 
             if same:
-                new_line = f'{prefix}{lambda_expr}){suffix_clean}'
+                # Count closing parens stripped from suffix to restore them
+                leading_close = re.match(r'^([}\)]+)', suffix_after or '')
+                extra_close = leading_close.group(1).replace('}', '').count(')') if leading_close else 0
+                close_parens = ')' * (1 + extra_close)
+                new_line = f'{prefix}{lambda_expr}{close_parens}{suffix_clean}'
                 if opens_block:
                     new_line += ' {'
             else:
@@ -911,35 +924,105 @@ def _collapse_arrow_callbacks(ts_content: str) -> str:
 def _strip_ts_type_blocks(ts_content: str) -> str:
     """
     Strip TypeScript type annotation blocks from method signatures.
-    Handles: `}: { ... } & SomeType): ReturnType {`
-    Collapses the entire type block into just `) {`.
+    Rewrites `methodName({ a, b, c }: { ... } & Type): ReturnType {`
+    into a single-line `methodName({ a, b, c }) {` so normal translation handles it.
     """
     lines = ts_content.split('\n')
     result = []
     i = 0
     while i < len(lines):
         line = lines[i]
-        # Detect start of a TS type block in a method signature: `  }: {`
-        if re.match(r'^\s*\}\s*:\s*\{', line.rstrip()):
-            # Skip lines until we find the closing `} & ...): ReturnType {`
+        # Detect: method declaration with destructured params opening: `methodName({`
+        # followed eventually by `}: {` type block start
+        # Strategy: look ahead for `}: {` within the next 10 lines
+        if re.search(r'\w+\s*\(\s*\{', line) and not re.search(r'\}\s*\)\s*', line):
+            # Collect param names until we hit `}: {` (start of type block)
+            param_names = []
+            found_type_block = False
             j = i
-            while j < len(lines):
-                s = lines[j].strip()
-                # End of type block: `} & SomeType): ReturnType {`  or just `}) {`
-                if re.search(r'\)\s*:\s*\w+.*\{?\s*$', s) and ('}' in s or ')' in s):
-                    # Emit just `) {` to close the method param list
-                    indent = line[: len(line) - len(line.lstrip())]
-                    if s.endswith('{'):
-                        result.append(indent + ') {')
+            lookahead_lines = []
+            while j < len(lines) and j < i + 15:
+                s = lines[j].strip().rstrip(';')
+                lookahead_lines.append(lines[j])
+                if re.match(r'^\}\s*:\s*\{', s):
+                    found_type_block = True
+                    # Skip ahead to end of type block
+                    k = j + 1
+                    while k < len(lines):
+                        ks = lines[k].strip()
+                        if re.search(r'\)\s*:\s*\w+.*\{?\s*$', ks) and ('}' in ks or ')' in ks):
+                            # Reconstruct single-line method sig from first line
+                            method_line = line.rstrip()
+                            # Already has `method({` — just close it with `) {`
+                            # Extract just the method open: e.g. `  protected getSymbolMetrics(`
+                            method_open = re.sub(r'\(\s*\{.*', '(', method_line)
+                            params_str = ', '.join(param_names) if param_names else ''
+                            indent = line[:len(line) - len(line.lstrip())]
+                            if ks.endswith('{'):
+                                result.append(f'{method_open}{{{params_str}}}) {{')
+                            else:
+                                result.append(f'{method_open}{{{params_str}}})')
+                            i = k + 1
+                            break
+                        # Collect param names from inside destructure block (before `}: {`)
+                        k += 1
                     else:
-                        result.append(indent + ')')
-                    i = j + 1
+                        # Didn't find end — fall through
+                        found_type_block = False
                     break
+                # Collect bare identifiers as param names (inside `{ a, b, c }`)
+                for token in re.split(r'[,\s]+', s):
+                    token = token.strip().lstrip('{').rstrip('}').rstrip('?')
+                    if re.match(r'^[a-zA-Z_]\w*$', token) and token:
+                        param_names.append(token)
                 j += 1
-            else:
-                result.append(line)
-                i += 1
-            continue
+
+            if found_type_block:
+                continue
+
+        result.append(line)
+        i += 1
+    return '\n'.join(result)
+
+
+def _join_split_method_signatures(ts_content: str) -> str:
+    """
+    Join multi-line method signatures into a single line.
+    Handles:
+      methodName(          →  methodName(param): ReturnType {
+        param: Type
+      ): ReturnType {
+    """
+    lines = ts_content.split('\n')
+    result = []
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        stripped = line.strip()
+        # Detect: line ends with `(` and is a method/function declaration (not a call in an expression)
+        # Must start with optional access modifier + identifier + `(`
+        if (re.match(r'^\s*(?:(?:protected|private|public|override|static|async)\s+)*\w+\s*\(\s*$', line)
+                and i + 1 < len(lines)):
+            # Peek ahead: collect until we find `)` or `): Type {`
+            j = i + 1
+            param_lines = []
+            found_close = False
+            while j < len(lines) and j < i + 8:
+                s = lines[j].strip()
+                # Closing paren line: `): ReturnType {` or `): ReturnType`  or just `)`
+                if re.match(r'^\)\s*(?::\s*\w[\w<>, ]*\s*)?\{?\s*$', s):
+                    found_close = True
+                    close_line = s
+                    j += 1
+                    break
+                param_lines.append(s)
+                j += 1
+            if found_close:
+                params = ' '.join(param_lines)
+                new_line = line.rstrip('( \n') + '(' + params + close_line
+                result.append(new_line)
+                i = j
+                continue
         result.append(line)
         i += 1
     return '\n'.join(result)
@@ -947,11 +1030,9 @@ def _strip_ts_type_blocks(ts_content: str) -> str:
 
 def translate_typescript_content(ts_content: str) -> str:
     """Translate TypeScript source code to Python."""
-    # Pre-process: remove multi-line imports
     ts_content = _strip_multiline_imports(ts_content)
-    # Pre-process: strip TS type annotation blocks from method signatures
+    ts_content = _join_split_method_signatures(ts_content)
     ts_content = _strip_ts_type_blocks(ts_content)
-    # Pre-process: collapse multi-line arrow callbacks
     ts_content = _collapse_arrow_callbacks(ts_content)
     lines = ts_content.split('\n')
 
@@ -1012,6 +1093,49 @@ def _fix_split_assignments(lines: list[str]) -> list[str]:
     return result
 
 
+def _drop_logger_console_args(code: str) -> str:
+    """Drop argument lines left by commented-out console.log() multi-line calls."""
+    lines = code.split('\n')
+    result = []
+    skip = False
+    for line in lines:
+        s = line.strip()
+        if '# console.log(' in line:
+            result.append(line)
+            skip = True
+            continue
+        if skip:
+            if s == ')':
+                skip = False
+            continue
+        result.append(line)
+    return '\n'.join(result)
+
+
+def _fix_ternary(code: str) -> str:
+    """Convert simple JS ternary `a ? b : c` to Python `b if a else c`.
+    Only handles single-token conditions to avoid false positives."""
+    # Only convert: identifier ? simpleExpr : simpleExpr
+    code = re.sub(
+        r'\b(\w+)\s*\?\s*(\'[^\']*\'|"[^"]*"|None|True|False|\w+)\s*:\s*(\'[^\']*\'|"[^"]*"|None|True|False|\w+)\b',
+        r'\2 if \1 else \3',
+        code
+    )
+    return code
+
+
+def _fix_unquoted_keys(code: str) -> str:
+    """Quote unquoted identifier keys in dict literals: `Foo: val` → `"Foo": val`."""
+    # Match lines with an unquoted PascalCase or camelCase key followed by `: value`
+    code = re.sub(
+        r'^(\s*)([A-Z][a-zA-Z0-9]*)\s*:\s*(\{)',
+        r'\1"\2": \3',
+        code,
+        flags=re.MULTILINE
+    )
+    return code
+
+
 def _drop_logger_warn_args(code: str) -> str:
     """Drop argument lines and closing ) left by commented-out Logger.warn calls."""
     lines = code.split('\n')
@@ -1034,11 +1158,12 @@ def _drop_logger_warn_args(code: str) -> str:
 def _post_process(code: str) -> str:
     """Fix common translation artifacts."""
     code = _drop_logger_warn_args(code)
+    code = _drop_logger_console_args(code)
+    code = _fix_ternary(code)
+    code = _fix_unquoted_keys(code)
     # Fix (None or {}).get("x") -> None
     code = re.sub(r'\(None or \{\}\)\.get\("(\w+)"\)', r'None', code)
-    # Collapse double spaces
-    code = re.sub(r'  +', '  ', code)
-    # Remove trailing whitespace
+    # Remove trailing whitespace (do NOT collapse leading spaces — that's indentation)
     code = '\n'.join(l.rstrip() for l in code.split('\n'))
     code = code.lstrip('\n')
     if not code.endswith('\n'):
