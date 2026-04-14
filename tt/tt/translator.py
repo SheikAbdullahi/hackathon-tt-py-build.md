@@ -49,6 +49,14 @@ def _translate_line(line: str) -> str:
     line = re.sub(r'^(\s*)export\s+(abstract\s+)?', r'\1', line)
     line = re.sub(r'^(\s*)abstract\s+', r'\1', line)
 
+    # Drop bare field declarations: private/protected/public fieldName: Type
+    # Must NOT match static properties, async/get/set methods, or constructors
+    if re.match(
+        r'^(private|protected|public)\s+(?!static\s)(?!async\s)(?!get\s)(?!set\s)\w+(?:[\s:[{]|$)',
+        stripped
+    ) and '(' not in stripped.split(':')[0]:
+        return ''
+
     # --- Class declaration ---
     line = re.sub(
         r'^(\s*)class\s+(\w+)\s+extends\s+(\w+)\s*\{',
@@ -843,10 +851,38 @@ def translate_typescript_content(ts_content: str) -> str:
     return code
 
 
+def _drop_logger_warn_continuations(code: str) -> str:
+    """Drop continuation lines after # Logger.warn( comments.
+
+    The translator comments out `Logger.warn(` but leaves the argument lines
+    (f-strings, bare strings, closing `)`) as live Python — causing SyntaxErrors.
+    This scans for the comment line and drops everything until the matching ).
+    """
+    lines = code.split('\n')
+    result = []
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        if re.match(r'^\s*# Logger\.warn\(', line):
+            result.append(line)   # keep the comment itself
+            i += 1
+            depth = 1
+            while i < len(lines) and depth > 0:
+                l = lines[i]
+                depth += l.count('(') - l.count(')')
+                i += 1            # drop all continuation lines silently
+        else:
+            result.append(line)
+            i += 1
+    return '\n'.join(result)
+
+
 def _post_process(code: str) -> str:
     """Fix common translation artifacts."""
     # Fix (None or {}).get("x") -> None
     code = re.sub(r'\(None or \{\}\)\.get\("(\w+)"\)', r'None', code)
+    # Drop dangling Logger.warn continuation lines
+    code = _drop_logger_warn_continuations(code)
     # Collapse double spaces
     code = re.sub(r'  +', '  ', code)
     # Remove trailing whitespace
